@@ -1,0 +1,369 @@
+/*+ ETLM {
+depend:{
+add:[
+	{name:"pr.plac"},
+	{name:"mra.sk"},
+    {name:"dl.so"},
+    {name:"rd.pic"},
+    {name:"map.sku"},
+    {name:"rd.change"},
+	{name:"rd.pic"},
+	{name:"dl.trans"},
+	{name:"dl.ba"}
+    ]
+}
+} */
+
+
+WITH t_pl AS 
+	(
+		SELECT 
+    
+        pla.POD AS PO,
+        pla.gl_product AS product_type,
+        pla.item,
+        pla.warehouse,
+        pla.gl_product_group,
+        TO_CHAR(NVL(pla.expected_delivery_datetime,pla.expected_delivery_datetime ),'YYYY-IW') AS EDD,
+        TO_CHAR(pla.day, 'YYYY-IW') AS Order_Week,
+        TO_CHAR(pla.day, 'IW') AS IW_Week,
+        TO_CHAR(NVL(pla.earliest_vendor_ship_datetime,pla.earliest_vendor_delivery_date), 'YYYY-IW') AS start,
+        TO_CHAR(NVL(pla.latest_vendor_ship_datetime,pla.latest_vendor_delivery_date), 'YYYY-IW') AS end,
+        pla.id_check,
+        pla.inv_g_id,
+        pla.QUANTITY_SUBMITTED AS Qty_Submitted,
+        pla.QUANTITY_ORDERED AS Qty_Confirmed,
+        pla.voided_quantity AS qty_canceled,
+        pla.quantity_received AS qty_received,
+        (vendor_expected_quantity - vendor_received_quantity) AS qty_expected
+		
+		FROM pr.plac pla
+		
+		WHERE  
+		pla.warehouse IN ('DE78','XD72','XD14','DE21','XBER','XG32','LT62','UKSA','RE32','DFR1','DFR5','RE34','SW78','AS21','BCN3','SA54')
+		AND pla.region_id = 'EU'
+		AND pla.day > TO_DATE(getdate (), 'YYYY/MM/DD') - 90
+	),
+	
+	
+sort_b AS
+	(
+		/*returning the items for the SKUs*/
+		SELECT 
+			
+		sku,it_id
+		
+		FROM mra.sk sku
+		
+		join t_pl
+		ON t_pl.item = sku.fulfillment_network_sku
+		
+		WHERE  region_id = 2
+		AND snapshot_day = TO_DATE(getdate(), 'YYYY/MM/DD')-1 
+		AND sku.fulfillment_network_sku  IN (SELECT   DISTINCT t_pl.item FROM t_pl)
+	),
+	
+	
+sort AS
+	(
+        /*check the sortability of the itmes*/
+        SELECT 
+        
+        CS.item,
+	    CS.marketplace,
+	    greatest(CS.length_cm, CS.width_cm, CS.height_cm) AS max_length,
+	    2 *(CS.length_cm + CS.width_cm + CS.height_cm) - max_length AS Girth,
+	    cs.weight_gr,
+    	number_of_boxes AS boxes
+        FROM
+        	dl.so CS
+        LEFT JOIN sort_b
+        	ON CS.itme = sort_b.it_id
+			
+        /*change the marketplace*/
+        WHERE  (itme IN (SELECT  distinct sort_b.it_id FROM sort_b) OR itme IN (SELECT  t_pl.item FROM t_pl)) AND marketplace IN (3,4,5,35691,44551)
+    ), 
+	
+	
+fin AS
+	(
+	/*refine the pipeline changing the SKUs with itmes*/
+        SELECT 
+        
+        t_pl.PO,
+        t_pl.inv_g_id,
+        t_pl.product_type,
+        t_pl.item AS SKU,
+        it_id AS itme,
+        t_pl.warehouse,
+        t_pl.id_check,
+        t_pl.gl_product_group,
+        t_pl.EDD,
+        t_pl.Order_Week,
+        t_pl.IW_Week,
+        t_pl.start,
+        t_pl.end,
+        t_pl.Qty_Submitted,
+        t_pl.Qty_Confirmed,
+        t_pl.qty_canceled,
+        t_pl.qty_received,
+        t_pl.qty_expected
+		
+        FROM  t_pl
+    
+        LEFT JOIN sort_b
+        ON t_pl.item = sort_b.sku 
+		
+        WHERE  LEFT(t_pl.item,1) = 'X'
+        
+        UNION ALL
+        
+        SELECT 
+        
+        t_pl.PO,
+        t_pl.inv_g_id,
+        t_pl.product_type,
+        t_pl.item AS SKU,
+        t_pl.item AS itme,
+        t_pl.warehouse,
+        t_pl.id_check,
+        t_pl.group,
+        t_pl.EDD,
+        t_pl.Order_Week,
+        t_pl.IW_Week,
+        t_pl.start,
+        t_pl.end,
+        t_pl.Qty_Submitted,
+        t_pl.Qty_Confirmed,
+        t_pl.qty_canceled,
+        t_pl.qty_received,
+        t_pl.qty_expected
+		
+        FROM  t_pl
+		
+        WHERE  LEFT(t_pl.item,1) = 'B'
+	),
+	
+	
+divs AS 
+	(
+        SELECT 
+            
+        a.PO,
+		/*correlated subquery in self join to return the aggregation in a middle granularity*/
+		(
+			SELECT SUM(qty_expected)
+			FROM fin b
+			WHERE 
+			(
+				marketplace IN (3,4,35691,44551) AND SortType IN ('BIG','MED','LONG')) 
+				or (marketplace IN (5) AND SortType IN ('BIG','MED','LONG','17kg')
+			) 
+			OR SortType IS null
+			AND a.PO = b.PO
+		) AS X_SELECT,
+		(
+			SELECT SUM(qty_expected)
+			FROM fin b
+			WHERE 
+			(
+				marketplace IN (3,4,35691,44551) AND SortType NOT IN ('BIG','MED','LONG')) 
+				or (marketplace IN (5) AND SortType NOT IN ('BIG','MED','LONG','17kg')
+			) 
+			OR SortType IS NOT null
+			AND a.PO = b.PO
+		) AS not_X_SELECT,
+        a.inv_g_id,
+        a.product_type,
+        a.SKU,
+        a.itme,
+        a.warehouse,
+        a.id_check,
+        a.gl_product_group,
+        a.EDD,
+        a.Order_Week,
+        a.IW_Week,
+        a.start,
+        a.end,
+        a.Qty_Submitted,
+        a.Qty_Confirmed,
+        a.qty_canceled,
+        a.qty_received,
+        a.qty_expected,
+        sort.marketplace,
+        sort.max_length,
+        sort.Girth,
+        sort.weight_gr,
+        sort.SortType,
+        sort.boxes
+        
+        FROM fin a
+        LEFT JOIN sort
+        ON a.itme = sort.itme
+        AND
+		CASE 
+			WHEN  a.warehouse = 'DE78' THEN sort.marketplace = 'DE' 
+			WHEN  a.warehouse = 'XD14' THEN sort.marketplace = 'DE' 
+			WHEN  a.warehouse = 'XD72' THEN sort.marketplace = 'DE' 
+			WHEN  a.warehouse = 'XBER' THEN sort.marketplace = 'DE' 
+			WHEN  a.warehouse = 'DE21' THEN sort.marketplace = 'DE' 
+			WHEN  a.warehouse = 'XG32' THEN sort.marketplace = 'UK' 
+			WHEN  a.warehouse = 'UKSA' THEN sort.marketplace = 'UK' 
+			WHEN  a.warehouse = 'RE32' THEN sort.marketplace = 'UK' 
+			WHEN  a.warehouse = 'LT62' THEN sort.marketplace = 'UK' 
+			WHEN  a.warehouse = 'DFR1' THEN sort.marketplace = 'FR' 
+			WHEN  a.warehouse = 'DFR5' THEN sort.marketplace = 'FR' 
+			WHEN  a.warehouse = 'RE34' THEN sort.marketplace = 'IT' 
+			WHEN  a.warehouse = 'SW78' THEN sort.marketplace = 'IT' 
+			WHEN  a.warehouse = 'AS21' THEN sort.marketplace = 'ES'
+			WHEN  a.warehouse = 'BCN3' THEN sort.marketplace = 'ES'
+			WHEN  a.warehouse = 'SA54' THEN sort.marketplace = 'ES'
+		END
+        GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24
+	), 
+
+share AS
+	(
+		SELECT  
+
+		divs.country,
+		divs.PO,
+		divs.warehouse,
+		divs.AMXL_SELECT ion,
+		divs.not_AMXL_SELECT ion,
+			CASE 
+				WHEN   divs.AMXL_SELECT iON > 0 or divs.not_AMXL_SELECT iON >0 THEN 100 * divs.AMXL_SELECT iON /(divs.AMXL_SELECT iON + divs.not_AMXL_SELECT ion)
+				ELSE -1
+			end AS XL_share,
+			CASE 
+				WHEN   divs.AMXL_SELECT iON > 0 or divs.not_AMXL_SELECT iON >0 THEN 100 * divs.not_AMXL_SELECT iON /(divs.AMXL_SELECT iON + divs.not_AMXL_SELECT ion)
+				ELSE -1
+			end AS no_XL_share
+			
+		FROM divs
+	)
+	
+	
+	
+	
+		SELECT 
+
+        divs.PO,
+        divs.inv_g_id,
+        divs.product_type,
+        divs.SKU,
+        divs.itme,
+        iog.is_retail,
+        divs.warehouse,
+        divs.gl_product_group,
+        divs.EDD,
+        divs.Order_Week,
+        divs.IW_Week,
+        divs.start,
+        divs.end,
+        divs.id_check,
+        divs.Qty_Submitted,
+        divs.Qty_Confirmed,
+        divs.qty_canceled,
+        divs.qty_received,
+        divs.qty_expected,
+        CASE
+            WHEN   divs.marketplace = 4 THEN 'DE'
+            WHEN   divs.marketplace = 3 THEN 'UK'
+            WHEN   divs.marketplace = 5 THEN 'FR'
+            WHEN   divs.marketplace = 35691 THEN 'IT'
+            WHEN   divs.marketplace = 44551 THEN 'ES'
+        END AS country,
+        divs.max_length,
+        divs.Girth,
+        divs.weight_gr,
+        divs.SortType,
+        divs.boxes,
+        share.AMXL_SELECT ion,
+        share.not_AMXL_SELECT ion,
+        share.XL_share,
+        CASE
+            WHEN   share.XL_share >= 0 AND share.XL_share < 10 THEN '0% to 10%'
+            WHEN   share.XL_share >= 10 AND share.XL_share < 20 THEN '10% to 20%'
+            WHEN   share.XL_share >= 20 AND share.XL_share < 30 THEN '20% to 30%'
+            WHEN   share.XL_share >= 30 AND share.XL_share < 40 THEN '30% to 40%'
+            WHEN   share.XL_share >= 40 AND share.XL_share < 50 THEN '40% to 50%'
+            WHEN   share.XL_share >= 50 AND share.XL_share < 60 THEN '50% to 60%'
+            WHEN   share.XL_share >= 60 AND share.XL_share < 70 THEN '60% to 70%'
+            WHEN   share.XL_share >= 70 AND share.XL_share < 80 THEN '70% to 80%'
+            WHEN   share.XL_share >= 80 AND share.XL_share < 90 THEN '80% to 90%'
+            WHEN   share.XL_share >= 90 AND share.XL_share < 100 THEN '90% to 100%'
+            WHEN   share.XL_share = 100 THEN '100%'
+            WHEN   share.XL_share = -1  THEN 'POs at 0'
+        END AS XL_check,
+        CASE 
+            WHEN   divs.warehouse IN ('DTM3','XDEA','XDEV','STR2','XGEB') THEN 'DE'
+        	WHEN   divs.warehouse IN ('XUKA','LTN7','DSA7','XUKS') THEN 'UK'
+        	WHEN   divs.warehouse IN ('XFRJ','XFRN') THEN 'FR'
+        	WHEN   divs.warehouse IN ('XITF','FCO5') THEN 'IT'
+        	WHEN   divs.warehouse IN ('PESA','BCN3','XIBA') THEN 'ES' 
+        END AS COUNTRY,
+        pf.from_wh,
+        pf.to_wh,
+        pf.first_modified_by,
+        pf.last_modified_by,
+        pf.total_flips,
+        pf.first_flip_date,
+        pf.last_flip_date,
+        pf.first_modified_team,
+        pf.manager_login,
+        pf.from_wh_type,
+        pf.to_wh_type,
+        pf.from_wh_country,
+        pf.to_wh_country,
+        do1.handler,
+        ba.requester,
+        ba.buying_intent,
+        ba.plan_type,
+        case
+            WHEN   pk_ven.p_code is not null THEN 'peak_vendor'
+            ELSE 'normal_vendor'
+        end AS peak_vendor,
+        case
+            WHEN   st.PO is not null THEN 'ASN_created'
+            ELSE 'no_ASN'
+        end AS ASN_check
+        
+		FROM divs
+
+		LEFT JOIN share on
+		divs.po = share.po AND divs.warehouse = share.warehouse
+
+		LEFT JOIN map.sku iog
+		ON divs.inv_g_id = iog.inv_g_id
+
+		LEFT JOIN rd.change PF 
+		ON divs.PO = pf.PO AND divs.item = pf.item 
+
+		LEFT JOIN
+		(
+			SELECT 
+			
+			vend AS p_code, marketplace
+			
+			FROM rd.pic
+			
+			WHERE  marketplace IN ('DE','FR','IT','ES','UK')
+			GROUP BY 1,2
+		) pk_ven
+		ON divs.id_check = pk_ven.p_code AND divs.marketplace = pk_ven.marketplace =
+	
+		LEFT JOIN
+		(
+			SELECT DISTINCT item.po_id AS PO
+			
+			FROM dl.trans  item
+			
+			WHERE 
+			item.db_regiON = 'EU' 
+			AND header.db_regiON = 'EU'
+		) st
+		ON st.PO = divs.PO
+		
+		LEFT JOIN dl.ba ba 
+		ON divs.PO = ba.order_id AND divs.SKU = ba.itme
